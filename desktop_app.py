@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import sys
 
 from server import (TeacherServer, DOM_ROOM_ID, DOM_TEACHER_ID, new_config,
                     utc_iso, ValidationError)
@@ -86,6 +87,7 @@ def main():
     parser.add_argument("--parent-hwnd", type=lambda value: int(value, 0))
     parser.add_argument("--expected-root-hwnd", type=lambda value: int(value, 0))
     parser.add_argument("--confirm-empty-cell", action="store_true")
+    parser.add_argument("--setup", action="store_true", help="打开无需命令行的安装窗口")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("此程序需要 Windows 和 WebView2")
@@ -93,6 +95,13 @@ def main():
         parser.error("须先明确确认所选同花顺空白格")
     if args.parent_hwnd is None and (args.confirm_empty_cell or args.expected_root_hwnd):
         parser.error("嵌入参数须提供明确的父窗口句柄")
+    installer = getattr(sys, "frozen", False) and Path(sys.executable).stem == "安装"
+    first_start = (getattr(sys, "frozen", False) and args.parent_hwnd is None
+                   and not (user_directory() / "board_config.json").is_file())
+    if args.setup or installer or first_start:
+        from desktop_setup import run_setup
+        run_setup()
+        return
     run(args)
 
 

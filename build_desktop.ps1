@@ -1,7 +1,8 @@
-param([string]$Python = 'python')
+param([string]$Python = 'python', [string]$OutputDirectory = '')
 $ErrorActionPreference = 'Stop'
 $componentPython = (Get-Command $Python -ErrorAction Stop).Source
 $componentOutput = Join-Path $env:LOCALAPPDATA 'THSTeacherDesktop/app'
+if ($OutputDirectory) { $componentOutput = [IO.Path]::GetFullPath($OutputDirectory) }
 $componentBuild = Join-Path $env:LOCALAPPDATA 'THSTeacherDesktop/build'
 & $componentPython -m PyInstaller --noconfirm --clean --windowed --onedir `
     --name THSTeacher --distpath $componentOutput --workpath $componentBuild `
