@@ -3,12 +3,76 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import time
 
 from server import TeacherFeed, ValidationError
+
+
+def reconcile_message_rows(rows, messages, width, create, dispose):
+    """Keep unchanged row objects (including loaded images) across snapshots.
+
+    Build replacements before discarding anything, so a failed build leaves
+    the last usable page intact. A None key represents the empty-state row.
+    """
+    prepared, created = {}, []
+    try:
+        for message in messages or [None]:
+            key = message["id"] if message is not None else None
+            signature = (width, json.dumps(message, ensure_ascii=False, sort_keys=True))
+            existing = rows.get(key)
+            if existing is not None and existing["signature"] == signature:
+                prepared[key] = existing
+            else:
+                row = create(message, width)
+                row["signature"] = signature
+                created.append(row)
+                prepared[key] = row
+    except Exception:
+        for row in created:
+            dispose(row)
+        raise
+    removed = [row for key, row in rows.items() if prepared.get(key) is not row]
+    for row in removed:
+        dispose(row)
+    rows.clear()
+    rows.update(prepared)
+    return len(created), len(prepared) - len(created), len(removed)
+
+
+def enable_double_buffer(control):
+    from System.Reflection import BindingFlags
+    prop = control.GetType().GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
+    prop.SetValue(control, True, None)
+    return control
+
+
+@contextmanager
+def suspend_redraw(control):
+    """Commit native rows and scroll position together, only on our control.
+
+    Do not send WM_SETREDRAW to hidden controls: enabling it can otherwise
+    make the inactive view or the reader behind the login page visible.
+    """
+    import ctypes
+    from ctypes import wintypes
+    if control.InvokeRequired:
+        raise RuntimeError("message rendering must run on its own UI thread")
+    handle = int(control.Handle.ToInt64()) if control.Visible and control.IsHandleCreated else None
+    send = ctypes.WinDLL("user32", use_last_error=True).SendMessageW
+    send.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    send.restype = ctypes.c_ssize_t
+    if handle is not None:
+        send(handle, 0x000B, 0, 0)  # WM_SETREDRAW(FALSE)
+    try:
+        yield
+    finally:
+        if handle is not None and not control.IsDisposed:
+            send(handle, 0x000B, 1, 0)
+            control.Invalidate(True)
 
 
 def message_page_bounds(total: int, page: int, page_size: int = 60) -> tuple[int, int, int, int]:
@@ -44,27 +108,30 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
         from System.Windows.Forms import (Application, Form, Panel, Label, Button,
             FlatStyle, FlowLayoutPanel, FlowDirection, Padding, AnchorStyles,
             ContextMenuStrip, AutoScaleMode, FormBorderStyle, Timer, PictureBox,
-            PictureBoxSizeMode, DockStyle, ToolStripDropDownDirection)
+            PictureBoxSizeMode, DockStyle, ToolStripDropDownDirection, SystemInformation)
         from desktop_webview import create_source_control
 
         form = None
         life = {"closing": False, "source": None, "board": None, "timer": None,
                 "ids": None, "first_ready": False, "content_width": None,
-                "panels": [], "images": [], "source_visible": False,
+                "panels": [], "rows": {}, "source_visible": False, "rendering": False,
                 "page": -1, "page_count": 1, "scroll_top": False, "scroll_latest": False,
                 "view": "teacher", "restore_scroll": None, "render_count": 0,
+                "row_creations": 0, "row_reuses": 0, "row_disposals": 0,
                 "views": {mode: {"page": -1, "scroll": 0,
-                           "panels": [], "images": [], "ids": None, "page_count": 1,
+                           "panels": [], "rows": {}, "ids": None, "page_count": 1,
                            "history": {"state": "idle", "pages": 0, "has_more": True, "oldest": None}}
                           for mode in ("teacher", "all")},
                 "picture_pool": ThreadPoolExecutor(max_workers=3, thread_name_prefix="teacher-image"),
                 "history": {"state": "idle", "pages": 0, "has_more": True, "oldest": None}}
+        life["panels"] = life["views"]["teacher"]["panels"]
+        life["rows"] = life["views"]["teacher"]["rows"]
         try:
             Application.EnableVisualStyles()
             Application.SetCompatibleTextRenderingDefault(False)
             board_path = base / "board_config.json"
             board_mode = board_path.exists() and args.parent_hwnd is None
-            form = Form()
+            form = enable_double_buffer(Form())
             form.Text = "老师消息组件"
             form.ClientSize = Size(900, 720)
             form.AutoScaleMode = getattr(AutoScaleMode, "None")
@@ -80,7 +147,7 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
             muted = Color.FromArgb(150, 150, 150)
             red = Color.FromArgb(169, 35, 26)
 
-            header = Panel()
+            header = enable_double_buffer(Panel())
             header.Height = 44
             header.BackColor = Color.FromArgb(28, 28, 28)
             form.Controls.Add(header)
@@ -131,7 +198,7 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
             rule.Height = 2
             rule.BackColor = red
             form.Controls.Add(rule)
-            scroll = FlowLayoutPanel()
+            scroll = enable_double_buffer(FlowLayoutPanel())
             scroll.AutoScroll = True
             scroll.FlowDirection = FlowDirection.TopDown
             scroll.WrapContents = False
@@ -139,7 +206,7 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
             scroll.BackColor = Color.FromArgb(13, 13, 13)
             form.Controls.Add(scroll)
             scrolls = {"teacher": scroll}
-            all_scroll = FlowLayoutPanel()
+            all_scroll = enable_double_buffer(FlowLayoutPanel())
             all_scroll.AutoScroll = True
             all_scroll.FlowDirection = FlowDirection.TopDown
             all_scroll.WrapContents = False
@@ -195,12 +262,12 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                     return
                 old = life["views"][life["view"]]
                 old.update(page=life["page"], scroll=scroll.VerticalScroll.Value, history=life["history"], visited=True)
-                old.update({key: life[key] for key in ("panels", "images", "ids", "page_count")})
+                old.update({key: life[key] for key in ("panels", "rows", "ids", "page_count")})
                 scroll.Visible = False
                 life["view"] = mode
                 saved = life["views"][mode]
                 scroll = scrolls[mode]
-                life.update({key: saved[key] for key in ("panels", "images", "ids", "page_count")})
+                life.update({key: saved[key] for key in ("panels", "rows", "ids", "page_count")})
                 life.update(page=saved["page"], history=saved["history"],
                             restore_scroll=saved["scroll"], scroll_latest=not saved.get("visited", False), scroll_top=False)
                 teachers_only.BackColor = red if mode == "teacher" else Color.FromArgb(35,35,35)
@@ -238,13 +305,17 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
             show_login.Click += lambda *_: select_source(True)
             exit_item.Click += lambda *_: form.Close()
 
-            def clear_rows():
-                for panel in life["panels"]:
-                    panel.Dispose()
-                life["panels"].clear()
-                for bitmap in life["images"]:
+            def dispose_row(row):
+                row["panel"].Dispose()
+                for bitmap in row["images"]:
                     bitmap.Dispose()
-                life["images"].clear()
+                row["images"].clear()
+
+            def clear_rows():
+                for row in life["rows"].values():
+                    dispose_row(row)
+                life["rows"].clear()
+                life["panels"].clear()
 
             def text_label(text, color=ink, face=font):
                 label = Label()
@@ -255,9 +326,10 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                 label.Font = face
                 return label
 
-            def load_picture(url, picture, width):
+            def load_picture(url, picture, image_store):
+                if life["closing"]:
+                    return
                 # This is a public image URL already checked by TeacherFeed.
-                image_store = life["images"]
                 def worker():
                     try:
                         if life["closing"] or picture.IsDisposed:
@@ -294,36 +366,10 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                         pass  # A failed image never hides the teacher's text.
                 life["picture_pool"].submit(worker)
 
-            def render(force=False):
-                snapshot = feeds[life["view"]].snapshot()
-                all_messages = snapshot["messages"]
-                start, end, current, pages = message_page_bounds(len(all_messages),life["page"])
-                life["page_count"] = pages
-                messages = all_messages[start:end]
-                newer = len(all_messages) - end
-                live_jump.Visible = newer > 0
-                live_jump.Text = f"查看最新（{newer} 条）"
-                previous.Enabled = current > 0
-                following.Enabled = current < life["page_count"] - 1
-                width = max(240, scroll.ClientSize.Width - 42)
-                signature = (life["view"], width, current, tuple(json.dumps(message, ensure_ascii=False,
-                             sort_keys=True) for message in messages))
-                if not force and life["ids"] == signature:
-                    if life["scroll_latest"] and life["panels"]:
-                        scroll.ScrollControlIntoView(life["panels"][-1])
-                        life["scroll_latest"] = False
-                    elif life["restore_scroll"] is not None:
-                        scroll.AutoScrollPosition = Point(0, min(life["restore_scroll"], scroll.VerticalScroll.Maximum))
-                    life["restore_scroll"] = None
-                    return
-                at_bottom = (scroll.VerticalScroll.Value + scroll.ClientSize.Height
-                             >= scroll.VerticalScroll.Maximum - 40)
-                old_scroll = scroll.VerticalScroll.Value
-                life["render_count"] += 1
-                scroll.SuspendLayout()
-                clear_rows()
-                if not messages:
-                    panel = Panel()
+            def create_row(message, width):
+                panel = enable_double_buffer(Panel())
+                row = {"panel": panel, "images": []}
+                if message is None:
                     panel.Width = width
                     panel.Height = 150
                     panel.Margin = Padding(0, 28, 0, 10)
@@ -334,10 +380,8 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                     login.Location = Point(6, 55)
                     login.Click += lambda *_: select_source(True)
                     panel.Controls.Add(login)
-                    scroll.Controls.Add(panel)
-                    life["panels"].append(panel)
-                for message in messages:
-                    panel = Panel()
+                    return row
+                try:
                     panel.Width = width
                     panel.Margin = Padding(0, 0, 0, 0)
                     panel.BackColor = scroll.BackColor
@@ -363,11 +407,11 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                         picture.BackColor = Color.FromArgb(23, 23, 23)
                         picture.SetBounds(4, bottom + 8, min(width - 12, 700), 240)
                         panel.Controls.Add(picture)
-                        load_picture(url, picture, width)
+                        load_picture(url, picture, row["images"])
                         bottom += 248
                     reply = message.get("reply_context")
                     if reply:
-                        quote = Panel()
+                        quote = enable_double_buffer(Panel())
                         quote.BackColor = Color.FromArgb(25, 25, 25)
                         quote.Width = width - 12
                         quote.Location = Point(4, bottom + 10)
@@ -393,7 +437,7 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                             picture.BackColor = quote.BackColor
                             picture.SetBounds(12, quote_bottom + 8, min(width - 42, 600), 190)
                             quote.Controls.Add(picture)
-                            load_picture(url, picture, width)
+                            load_picture(url, picture, row["images"])
                             quote_bottom += 198
                         quote.Height = quote_bottom + 12
                         accent = Panel()
@@ -407,25 +451,82 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                     separator.SetBounds(4, bottom + 10, width - 8, 1)
                     panel.Controls.Add(separator)
                     panel.Height = bottom + 19
-                    scroll.Controls.Add(panel)
-                    life["panels"].append(panel)
-                life["ids"] = signature
-                scroll.ResumeLayout(True)
+                except Exception:
+                    dispose_row(row)
+                    raise
+                return row
+
+            def position_reader(anchor=None, old_scroll=0, at_bottom=False):
                 if life["scroll_latest"] and life["panels"]:
                     scroll.ScrollControlIntoView(life["panels"][-1])
-                    life["scroll_latest"] = False
                 elif life["scroll_top"]:
                     scroll.AutoScrollPosition = Point(0, 0)
-                    life["scroll_top"] = False
                 elif life["restore_scroll"] is not None:
                     scroll.AutoScrollPosition = Point(0, min(life["restore_scroll"], scroll.VerticalScroll.Maximum))
                 elif at_bottom and life["panels"]:
                     scroll.ScrollControlIntoView(life["panels"][-1])
+                elif anchor is not None and anchor[0] in life["rows"]:
+                    panel = life["rows"][anchor[0]]["panel"]
+                    position = scroll.VerticalScroll.Value + panel.Top - anchor[1]
+                    scroll.AutoScrollPosition = Point(0, max(0, position))
                 elif old_scroll:
                     scroll.AutoScrollPosition = Point(0, min(old_scroll, scroll.VerticalScroll.Maximum))
-                life["restore_scroll"] = None
+                life.update(scroll_latest=False, scroll_top=False, restore_scroll=None)
+
+            def render(force=False):
+                if life["closing"] or life["rendering"]:
+                    return
+                all_messages = feeds[life["view"]].snapshot()["messages"]
+                start, end, current, pages = message_page_bounds(len(all_messages), life["page"])
+                life["page_count"] = pages
+                messages = all_messages[start:end]
+                newer = len(all_messages) - end
+                live_jump.Visible = newer > 0
+                live_jump.Text = f"查看最新（{newer} 条）"
+                previous.Enabled = current > 0
+                following.Enabled = current < pages - 1
+                # Reserve the scrollbar gutter even on an empty/short page.
+                # Clearing/adding rows must not alternate the measured width.
+                width = max(240, scroll.Width - 42 - SystemInformation.VerticalScrollBarWidth)
+                signature = (width, tuple(json.dumps(message, ensure_ascii=False, sort_keys=True)
+                                          for message in messages))
+                if not force and life["ids"] == signature:
+                    if life["scroll_latest"] or life["scroll_top"] or life["restore_scroll"] is not None:
+                        position_reader()
+                    return
+                at_bottom = (scroll.VerticalScroll.Value + scroll.ClientSize.Height
+                             >= scroll.VerticalScroll.Maximum - 40)
+                old_scroll = scroll.VerticalScroll.Value
+                anchor = next(((key, row["panel"].Top) for key, row in life["rows"].items()
+                               if row["panel"].Bottom > scroll.Padding.Top), None)
+                life["rendering"] = True
+                try:
+                    with suspend_redraw(scroll):
+                        scroll.SuspendLayout()
+                        try:
+                            created, reused, removed = reconcile_message_rows(
+                                life["rows"], messages, width, create_row, dispose_row)
+                            panels = [row["panel"] for row in life["rows"].values()]
+                            for index, panel in enumerate(panels):
+                                if panel.Parent != scroll:
+                                    scroll.Controls.Add(panel)
+                                if scroll.Controls.GetChildIndex(panel) != index:
+                                    scroll.Controls.SetChildIndex(panel, index)
+                            life["panels"][:] = panels
+                            life["row_creations"] += created
+                            life["row_reuses"] += reused
+                            life["row_disposals"] += removed
+                            life["render_count"] += 1
+                            life["ids"] = signature
+                        finally:
+                            scroll.ResumeLayout(True)
+                        position_reader(anchor, old_scroll, at_bottom)
+                finally:
+                    life["rendering"] = False
 
             def layout(*_):
+                if life["closing"]:
+                    return
                 width, height = form.ClientSize.Width, form.ClientSize.Height
                 header.SetBounds(0, 0, width, 78)
                 settings.Location = Point(max(0, width - 77), 9)
@@ -467,15 +568,11 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                     for saved in life["views"].values():
                         saved.update(page=-1, scroll=0)
                         saved["ids"] = None
-                    for cached_scroll in scrolls.values():
-                        cached_scroll.Controls.Clear()
                     for saved in life["views"].values():
-                        for panel in saved["panels"]:
-                            panel.Dispose()
+                        for row in saved["rows"].values():
+                            dispose_row(row)
+                        saved["rows"].clear()
                         saved["panels"].clear()
-                        for bitmap in saved["images"]:
-                            bitmap.Dispose()
-                        saved["images"].clear()
                     life["ids"] = None
                     life["first_ready"] = False
                 refresh()
@@ -484,6 +581,8 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                 record(source_state=details.get("state"), source_reason=details.get("reason"))
 
             def on_history(details):
+                if life["closing"]:
+                    return
                 source_view = details.get("view_mode", "teacher")
                 life["views"][source_view]["history"] = details
                 if source_view != life["view"]:
@@ -527,6 +626,9 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                 reader = {"reader_page": current, "reader_pages": life["page_count"],
                           "view_mode": life["view"],
                           "reader_render_count": life["render_count"],
+                          "reader_row_creations": life["row_creations"],
+                          "reader_row_reuses": life["row_reuses"],
+                          "reader_row_disposals": life["row_disposals"],
                           "teacher_cached": feeds["teacher"].status()["message_count"],
                           "all_cached": feeds["all"].status()["message_count"],
                           "reader_students": sum(message.get("role") == "student" for message in messages[first_index:last_index]),
@@ -555,11 +657,11 @@ def run_native(args, resources: Path, base: Path, config: dict) -> None:
                     life["board"].dispose()
                 clear_rows()
                 for saved in life["views"].values():
-                    if saved["panels"] is not life["panels"]:
-                        for panel in saved["panels"]:
-                            panel.Dispose()
-                        for bitmap in saved["images"]:
-                            bitmap.Dispose()
+                    if saved["rows"] is not life["rows"]:
+                        for row in saved["rows"].values():
+                            dispose_row(row)
+                        saved["rows"].clear()
+                        saved["panels"].clear()
                 record(mode="closed")
 
             form.FormClosing += close

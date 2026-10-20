@@ -114,7 +114,7 @@ class BoardAttachment:
                 and self._caption(root_hwnd).endswith(" - " + config["board_name"]))
 
     def _hide_own(self) -> None:
-        if not self.form.IsDisposed:
+        if not self.form.IsDisposed and self.form.Visible:
             self.form.Hide()
 
     def _report(self, state: str, reason: str, *, board_visible: bool = False,
@@ -246,7 +246,8 @@ class BoardAttachment:
             self._hide_own()
             self._report("hidden", "other_board_active", verified_parent=True)
             return
-        self.form.Show()
+        if not self.form.Visible:
+            self.form.Show()
         if (self._host.get_parent(self._child()) != self._fingerprint["hwnd"]
                 or not self._host.is_child(self._fingerprint["hwnd"], self._child())):
             raise EmbeddingError("显示老师组件后父子关系校验失败。")
