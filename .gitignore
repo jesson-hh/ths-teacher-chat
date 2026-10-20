@@ -18,3 +18,9 @@ board_config.json
 bridge_config.json
 desktop_status.json
 startup_error.txt
+# Earlier browser-preview experiments are outside the native package.
+/extension/
+/native_host.py
+/prepare.py
+/smoke_host.py
+/启动预览.ps1
