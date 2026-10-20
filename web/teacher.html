@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>老师消息 · 同花顺组件</title>
+  <link rel="stylesheet" href="/teacher.css">
+  <script defer src="/teacher.js"></script>
+</head>
+<body>
+  <div class="feed-shell">
+    <header class="feed-header">
+      <div class="heading-row">
+        <span class="brand-seal" aria-hidden="true">观<br>澜</span>
+        <div class="heading-copy">
+          <h1 id="teacher-name">老师消息</h1>
+          <p class="teacher-identity">主讲：何志坚<span>投顾编号：A0670626090043</span></p>
+          <p class="feed-purpose">只看老师<span id="identity-method">公开消息</span></p>
+        </div>
+        <button id="font-size" class="font-button" type="button" aria-label="放大消息字号" title="切换消息字号">字</button>
+      </div>
+      <div class="connection-row" role="status" aria-live="polite">
+        <span id="connection-dot" class="connection-dot waiting" aria-hidden="true"></span>
+        <span id="connection-label">正在连接本机组件</span>
+        <span id="message-count" class="message-count">0 条</span>
+      </div>
+    </header>
+
+    <main id="feed-scroll" class="feed-scroll" aria-label="老师消息时间线">
+      <div id="empty-state" class="empty-state">
+        <span class="empty-mark" aria-hidden="true">信</span>
+        <h2 id="empty-title">等待老师消息</h2>
+        <p id="empty-description">打开已配对的约牛公开聊天室后，老师的新消息会显示在这里。</p>
+        <p class="empty-note">本栏只读，不显示学员发言和私信</p>
+      </div>
+      <div id="message-list" class="message-list" aria-label="老师公开消息"></div>
+    </main>
+
+    <button id="new-messages" class="new-messages" type="button" hidden>查看新消息</button>
+    <footer class="feed-footer">
+      <span id="last-sync">尚未收到公开消息</span>
+      <button id="latest" type="button">回到最新 <span aria-hidden="true">↓</span></button>
+    </footer>
+    <p class="risk-note">投资有风险，入市需谨慎</p>
+  </div>
+
+  <dialog id="image-dialog" aria-label="查看消息图片">
+    <button id="close-image" type="button" aria-label="关闭图片">关闭 ×</button>
+    <img id="expanded-image" alt="老师消息图片原图">
+  </dialog>
+</body>
+</html>
